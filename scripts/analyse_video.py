@@ -172,7 +172,7 @@ def transcrire(audio, modele, langue):
                 segments.append({"debut": s.start, "fin": s.end, "texte": s.text.strip()})
                 if len(segments) % 50 == 0:
                     log(f"  … {hms(s.end)} transcrit ({time.time() - t0:.0f} s)")
-            return segments, info.language
+            return segments, info.language, nom
         except Exception as e:  # GPU absent, VRAM pleine, DLL manquante…
             log(f"  échec sur {device} : {e}")
     raise RuntimeError("Transcription impossible")
@@ -301,6 +301,15 @@ def traiter(source, a, out=None):
     else:
         video = src
 
+    # Certains sites (Instagram…) ne donnent pas la durée : on la lit dans le fichier
+    if duree <= 0 and video:
+        duree = infos_locales(video)["duration"]
+        if duree > 0:
+            log(f"Durée lue dans le fichier : {hms(duree)}")
+            info = dossier / "info.md"
+            info.write_text(info.read_text(encoding="utf-8").replace(
+                "- **Durée** : 00:00", f"- **Durée** : {hms(duree)}", 1), encoding="utf-8")
+
     # Transcription : sous-titres humains si dispo, sinon Whisper
     segments, origine = None, None
     if url and not a.forcer_whisper:
@@ -313,8 +322,8 @@ def traiter(source, a, out=None):
         audio = dossier / "audio.wav"
         log("Extraction audio…")
         run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(video), "-vn", "-ac", "1", "-ar", "16000", str(audio)])
-        segments, lang = transcrire(audio, a.modele, a.langue)
-        origine = f"Whisper {a.modele} (langue détectée : {lang})"
+        segments, lang, modele_utilise = transcrire(audio, a.modele, a.langue)
+        origine = f"Whisper {modele_utilise} (langue détectée : {lang})"
         audio.unlink(missing_ok=True)
     mots = ecrire_transcription(segments, dossier)
     log(f"Transcription : {len(segments)} segments, ~{mots} mots ({origine})")
