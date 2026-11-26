@@ -1,92 +1,75 @@
-"""Prépare une vidéo pour que Claude puisse la résumer.
+"""Prépare une vidéo pour que Claude puisse la résumer ou s'en servir comme contexte.
 
-Entrée : une URL (YouTube, etc., tout ce que yt-dlp sait lire) ou un fichier local.
-Sortie : un dossier avec
-  - info.md          métadonnées (titre, chaîne, durée, chapitres, description)
-  - transcript.md    transcription horodatée, en paragraphes de ~45 s
-  - segments.json    segments bruts (début, fin, texte)
+Entrée : une URL (YouTube, etc. : tout ce que yt-dlp sait lire) ou un fichier local.
+Sortie, dans le dossier de la vidéo :
+  - info.md          métadonnées (titre, auteur, durée, chapitres, description)
+  - transcript.md    transcription horodatée, en paragraphes d'environ 45 s
+  - segments.json    segments bruts (début, fin, texte) : sert à la recherche
   - frames/          images extraites à intervalle régulier
-  - planches/        planches contact 3x3 légendées avec le timecode
-Le résumé lui-même (resume.md) est écrit ensuite par Claude.
+  - planches/        planches 3x3 légendées avec le timecode
+  - manifeste.json   identifiant, source, chemins : sert à la bibliothèque
+Le résumé (resume.md) est écrit ensuite par Claude, pas par ce script.
 
 Usage :
-  python analyse_video.py <url|fichier> [--out DOSSIER] [--modele large-v3-turbo]
-                          [--langue fr] [--images 36] [--sans-images] [--forcer-whisper]
+  python analyse_video.py <url|fichier> [...] [--out DOSSIER] [--modele large-v3-turbo]
+                          [--langue fr] [--images 36] [--sans-images] [--forcer-whisper] [--refaire]
 """
 import argparse
+import hashlib
 import json
 import os
 import re
+import shutil
 import site
 import subprocess
 import sys
 import time
+import wave
 from pathlib import Path
 
 import bibliotheque
-
-DOSSIER_RACINE = bibliotheque.RACINE
+from outils import commande, hms, log, run, slug
 
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
-
-def log(msg):
-    print(f"[video-resume] {msg}", flush=True)
-
-
-def hms(sec):
-    sec = int(sec)
-    h, r = divmod(sec, 3600)
-    m, s = divmod(r, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+MODELE_CPU = "small"  # repli si le GPU ou son modèle ne marche pas
+POLICES = ("DejaVuSans-Bold.ttf", "arialbd.ttf", "Arial Bold.ttf", "LiberationSans-Bold.ttf",
+           "Helvetica.ttc", "Arial.ttf", "arial.ttf")
 
 
-def slug(texte, maxi=60):
-    texte = re.sub(r"[^\w\s-]", "", texte, flags=re.UNICODE).strip().lower()
-    return re.sub(r"[\s_-]+", "-", texte)[:maxi].strip("-") or "video"
-
-
-class ErreurCommande(subprocess.CalledProcessError):
-    def __str__(self):
-        lignes = (self.stderr or "").strip().splitlines()
-        utiles = [l for l in lignes if "ERROR" in l] or lignes[-3:]
-        return f"{Path(self.cmd[0]).name} : " + (" | ".join(utiles) or f"code {self.returncode}")
-
-
-def run(cmd, **kw):
-    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", **kw)
-    if r.returncode:
-        raise ErreurCommande(r.returncode, cmd, r.stdout, r.stderr)
-    return r
-
+# ---------- 1. Récupération ----------
 
 def est_url(s):
     return re.match(r"^https?://", s) is not None
 
 
-# ---------- 1. Récupération ----------
+def identifiant(meta, url, src=None):
+    if url:
+        return f"{meta.get('extractor_key') or 'web'}:{meta.get('id') or url}"
+    return f"fichier:{src}:{src.stat().st_size}"
+
 
 def infos_url(url):
-    out = run(["yt-dlp", "-J", "--no-playlist", url]).stdout
-    return json.loads(out)
+    return json.loads(run(commande("yt-dlp", "-J", "--no-playlist", url)).stdout)
 
 
 def telecharger(url, dossier, avec_video):
+    for vieux in dossier.glob("source.*"):  # reste d'un essai interrompu
+        vieux.unlink(missing_ok=True)
     fmt = "bv*[height<=480]+ba/b[height<=480]/b" if avec_video else "ba/b"
-    modele = str(dossier / "source.%(ext)s")
-    run(["yt-dlp", "--no-playlist", "-f", fmt, "-o", modele, url])
+    run(commande("yt-dlp", "--no-playlist", "-f", fmt, "-o", str(dossier / "source.%(ext)s"), url))
     fichiers = [f for f in dossier.glob("source.*") if f.suffix not in (".part", ".ytdl")]
     if not fichiers:
-        raise RuntimeError("Téléchargement échoué")
+        raise RuntimeError("téléchargement échoué")
     return fichiers[0]
 
 
 def sous_titres_manuels(url, dossier, langues):
-    """Sous-titres écrits par un humain (pas les auto). None si absents."""
+    """Sous-titres écrits par un humain (pas les automatiques). None si absents."""
     try:
-        run(["yt-dlp", "--no-playlist", "--skip-download", "--write-subs",
-             "--sub-langs", ",".join(langues), "--sub-format", "vtt",
-             "-o", str(dossier / "subs.%(ext)s"), url])
+        run(commande("yt-dlp", "--no-playlist", "--skip-download", "--write-subs",
+                     "--sub-langs", ",".join(langues), "--sub-format", "vtt",
+                     "-o", str(dossier / "subs.%(ext)s"), url))
     except subprocess.CalledProcessError:
         return None
     vtts = sorted(dossier.glob("subs*.vtt"))
@@ -98,13 +81,13 @@ def lire_vtt(chemin):
     vu = set()
 
     def secs(t):
-        p = t.replace(",", ".").split(":")
-        p = [float(x) for x in p]
+        p = [float(x) for x in t.replace(",", ".").split(":")]
         return p[0] * 3600 + p[1] * 60 + p[2] if len(p) == 3 else p[0] * 60 + p[1]
 
     def pousser():
-        txt = re.sub(r"<[^>]+>", "", " ".join(lignes)).strip()
-        if debut is not None and txt and txt not in vu:
+        txt = re.sub(r"<[^>]+>", "", " ".join(lignes))
+        txt = re.sub(r"\s+", " ", txt).strip()
+        if debut is not None and txt and txt not in vu:  # YouTube répète les lignes d'une bouche à l'autre
             vu.add(txt)
             segments.append({"debut": debut, "fin": fin, "texte": txt})
 
@@ -120,15 +103,15 @@ def lire_vtt(chemin):
 
 
 def infos_locales(fichier):
-    out = run(["ffprobe", "-v", "quiet", "-print_format", "json",
-               "-show_format", "-show_chapters", str(fichier)]).stdout
+    out = run(commande("ffprobe", "-v", "quiet", "-print_format", "json",
+                       "-show_format", "-show_chapters", str(fichier))).stdout
     d = json.loads(out)
     fmt = d.get("format", {})
     tags = {k.lower(): v for k, v in fmt.get("tags", {}).items()}
     return {
         "title": tags.get("title") or Path(fichier).stem,
         "uploader": tags.get("artist") or tags.get("author"),
-        "duration": float(fmt.get("duration", 0)),
+        "duration": float(fmt.get("duration", 0) or 0),
         "description": tags.get("comment") or tags.get("description"),
         "chapters": [{"start_time": float(c["start_time"]), "title": c.get("tags", {}).get("title", "")}
                      for c in d.get("chapters", [])],
@@ -151,21 +134,20 @@ def ajouter_dll_cuda():
 
 def transcrire(audio, modele, langue):
     ajouter_dll_cuda()
-    import wave
     import numpy as np
     from faster_whisper import WhisperModel
 
-    # WAV 16 kHz mono déjà produit par ffmpeg : on le lit nous-mêmes (évite PyAV)
+    # WAV 16 kHz mono produit par ffmpeg : on le lit nous-mêmes (évite PyAV)
     with wave.open(str(audio), "rb") as w:
         pcm = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
-    audio = pcm.astype(np.float32) / 32768.0
+    donnees = pcm.astype(np.float32) / 32768.0
 
-    essais = [("cuda", "int8_float16", modele), ("cpu", "int8", "small")]
-    for device, compute, nom in essais:
+    erreurs = []
+    for device, compute, nom in (("cuda", "int8_float16", modele), ("cpu", "int8", MODELE_CPU)):
         try:
             log(f"Whisper : modèle {nom} sur {device}…")
             m = WhisperModel(nom, device=device, compute_type=compute)
-            segs, info = m.transcribe(audio, language=langue, vad_filter=True,
+            segs, info = m.transcribe(donnees, language=langue, vad_filter=True,
                                       beam_size=5, condition_on_previous_text=False)
             segments, t0 = [], time.time()
             for s in segs:
@@ -173,9 +155,23 @@ def transcrire(audio, modele, langue):
                 if len(segments) % 50 == 0:
                     log(f"  … {hms(s.end)} transcrit ({time.time() - t0:.0f} s)")
             return segments, info.language
-        except Exception as e:  # GPU absent, VRAM pleine, DLL manquante…
+        except Exception as e:  # GPU absent, VRAM pleine, DLL manquante, modèle non téléchargeable…
+            erreurs.append(f"{device}/{nom} : {e}")
             log(f"  échec sur {device} : {e}")
-    raise RuntimeError("Transcription impossible")
+    raise RuntimeError(
+        "transcription impossible (" + " ; ".join(erreurs) + "). Si le téléchargement du modèle est bloqué "
+        "(pare-feu, hors ligne), télécharge-le à l'avance et passe son dossier avec --modele.")
+
+
+def transcrire_fichier(video, dossier, a):
+    audio = dossier / "audio.wav"
+    log("Extraction audio…")
+    run(commande("ffmpeg", "-y", "-loglevel", "error", "-i", str(video), "-vn", "-ac", "1", "-ar", "16000", str(audio)))
+    try:
+        segments, lang = transcrire(audio, a.modele, a.langue)
+    finally:
+        audio.unlink(missing_ok=True)
+    return segments, f"Whisper {a.modele} (langue détectée : {lang})"
 
 
 def ecrire_transcription(segments, dossier, duree_bloc=45):
@@ -202,42 +198,56 @@ def extraire_images(video, dossier, duree, nb):
     frames = dossier / "frames"
     frames.mkdir(exist_ok=True)
     pas = max(duree / (nb + 1), 2)
-    images = []
+    images, echecs = [], 0
     for i in range(1, nb + 1):
         t = pas * i
         if t >= duree:
             break
         sortie = frames / f"{int(t):06d}s.jpg"
         try:
-            run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{t:.2f}", "-i", str(video),
-                 "-frames:v", "1", "-vf", "scale=640:-2", "-q:v", "4", str(sortie)])
-            if sortie.exists():
-                images.append((t, sortie))
+            run(commande("ffmpeg", "-y", "-loglevel", "error", "-ss", f"{t:.2f}", "-i", str(video),
+                         "-frames:v", "1", "-vf", "scale=640:-2", "-q:v", "4", str(sortie)))
         except subprocess.CalledProcessError:
             pass
+        if sortie.exists():
+            images.append((t, sortie))
+        else:
+            echecs += 1
+    if echecs:
+        log(f"  {echecs} image(s) n'ont pas pu être extraites")
     return images
 
 
+def police(taille=22):
+    from PIL import ImageFont
+    for nom in POLICES:  # noms usuels Linux, Windows, macOS
+        try:
+            return ImageFont.truetype(nom, taille)
+        except OSError:
+            continue
+    try:
+        return ImageFont.load_default(size=taille)  # Pillow ≥ 10.1
+    except TypeError:
+        return ImageFont.load_default()
+
+
 def planches(images, dossier):
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw
     sortie = dossier / "planches"
     sortie.mkdir(exist_ok=True)
-    try:
-        police = ImageFont.truetype("arial.ttf", 22)
-    except OSError:
-        police = ImageFont.load_default()
+    fonte = police()
     chemins = []
     for n in range(0, len(images), 9):
         lot = images[n:n + 9]
         vignettes = [Image.open(p).convert("RGB") for _, p in lot]
         w, h = 640, max(v.height for v in vignettes)
         planche = Image.new("RGB", (w * 3, h * ((len(lot) + 2) // 3)), "black")
+        d = ImageDraw.Draw(planche)
         for i, ((t, _), v) in enumerate(zip(lot, vignettes)):
             x, y = (i % 3) * w, (i // 3) * h
             planche.paste(v, (x, y))
-            d = ImageDraw.Draw(planche)
             d.rectangle([x, y, x + 90, y + 30], fill="black")
-            d.text((x + 6, y + 3), hms(t), fill="yellow", font=police)
+            d.text((x + 6, y + 3), hms(t), fill="yellow", font=fonte)
         c = sortie / f"planche_{n // 9 + 1:02d}_{hms(lot[0][0]).replace(':', '-')}.jpg"
         planche.save(c, quality=80)
         chemins.append(c)
@@ -246,11 +256,15 @@ def planches(images, dossier):
 
 # ---------- Principal ----------
 
+def dossier_pour(titre, ident, deja):
+    """Dossier de la vidéo : celui de la bibliothèque si elle y est déjà, sinon un nouveau.
 
-def identifiant(meta, url, src=None):
-    if url:
-        return f"{meta.get('extractor_key', 'web')}:{meta.get('id')}"
-    return f"fichier:{src}:{src.stat().st_size}"
+    Le suffixe issu de l'identifiant évite que deux vidéos de même titre le même jour s'écrasent.
+    """
+    if deja:
+        return Path(deja["dossier"])
+    court = hashlib.sha1(ident.encode("utf-8")).hexdigest()[:6]
+    return bibliotheque.RACINE / f"{time.strftime('%Y-%m-%d')}_{slug(titre)}_{court}"
 
 
 def traiter(source, a, out=None):
@@ -273,8 +287,11 @@ def traiter(source, a, out=None):
         return deja
 
     titre = meta.get("title") or "video"
-    dossier = Path(out) if out else DOSSIER_RACINE / f"{time.strftime('%Y-%m-%d')}_{slug(titre)}"
+    dossier = Path(out) if out else dossier_pour(titre, ident, deja)
     dossier.mkdir(parents=True, exist_ok=True)
+    # --refaire régénère transcription et images, mais garde resume.md et info.md
+    for vieux in ("frames", "planches"):
+        shutil.rmtree(dossier / vieux, ignore_errors=True)
     duree = float(meta.get("duration") or 0)
     log(f"« {titre} » ({hms(duree)}) → {dossier}")
 
@@ -301,7 +318,7 @@ def traiter(source, a, out=None):
     else:
         video = src
 
-    # Transcription : sous-titres humains si dispo, sinon Whisper
+    # Transcription : sous-titres humains si disponibles, sinon Whisper
     segments, origine = None, None
     if url and not a.forcer_whisper:
         langues = [a.langue] if a.langue else ["fr", "fr-FR", "en", "en-US", "en-GB"]
@@ -310,36 +327,31 @@ def traiter(source, a, out=None):
             segments, origine = lire_vtt(vtt), f"sous-titres manuels ({vtt.name})"
             log(f"Sous-titres manuels trouvés : {vtt.name}")
     if not segments:
-        audio = dossier / "audio.wav"
-        log("Extraction audio…")
-        run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(video), "-vn", "-ac", "1", "-ar", "16000", str(audio)])
-        segments, lang = transcrire(audio, a.modele, a.langue)
-        origine = f"Whisper {a.modele} (langue détectée : {lang})"
-        audio.unlink(missing_ok=True)
+        segments, origine = transcrire_fichier(video, dossier, a)
     mots = ecrire_transcription(segments, dossier)
     log(f"Transcription : {len(segments)} segments, ~{mots} mots ({origine})")
 
     # Images
     chemins_planches = []
-    a_video = run(["ffprobe", "-v", "quiet", "-select_streams", "v",
-                   "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(video)]).stdout.strip()
+    a_video = run(commande("ffprobe", "-v", "quiet", "-select_streams", "v",
+                           "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(video))).stdout.strip()
     if not a.sans_images and a_video and duree > 0:
         log("Extraction des images…")
         images = extraire_images(video, dossier, duree, a.images)
         chemins_planches = planches(images, dossier)
         log(f"{len(images)} images, {len(chemins_planches)} planches")
 
-    # Ménage : on ne garde pas la vidéo téléchargée
+    # Ménage : la vidéo téléchargée n'est pas gardée
     if url:
         for f in dossier.glob("source.*"):
             f.unlink(missing_ok=True)
 
     manifeste = {
-        "id": ident, "titre": titre, "auteur": meta.get("uploader"),
+        "schema": 2, "id": ident, "titre": titre, "auteur": meta.get("uploader"),
         "source": meta.get("webpage_url") or str(src), "duree": hms(duree),
         "analysee_le": time.strftime("%Y-%m-%d"), "dossier": str(dossier),
         "transcription": origine, "mots": mots,
-        "fichiers": {"info": "info.md", "transcript": "transcript.md",
+        "fichiers": {"info": "info.md", "transcript": "transcript.md", "segments": "segments.json",
                      "planches": [str(p.relative_to(dossier)) for p in chemins_planches]},
     }
     (dossier / "manifeste.json").write_text(json.dumps(manifeste, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -347,13 +359,13 @@ def traiter(source, a, out=None):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="Prépare des vidéos pour le skill video-resume.")
     ap.add_argument("sources", nargs="+", help="un ou plusieurs liens / fichiers")
     ap.add_argument("--out", help="dossier de sortie (une seule vidéo)")
-    ap.add_argument("--modele", default="large-v3-turbo")
+    ap.add_argument("--modele", default="large-v3-turbo", help="modèle faster-whisper, ou son dossier local")
     ap.add_argument("--langue", default=None, help="fr, en… (auto si absent)")
-    ap.add_argument("--images", type=int, default=36)
-    ap.add_argument("--sans-images", action="store_true")
+    ap.add_argument("--images", type=int, default=36, help="nombre d'images extraites")
+    ap.add_argument("--sans-images", action="store_true", help="audio seul (podcast)")
     ap.add_argument("--forcer-whisper", action="store_true",
                     help="ignorer les sous-titres manuels et transcrire quand même")
     ap.add_argument("--refaire", action="store_true", help="retraiter même si déjà dans la bibliothèque")
@@ -371,6 +383,8 @@ def main():
     bibliotheque.ecrire_index()
     print("\n=== PRÊT ===")
     print(json.dumps(resultats, ensure_ascii=False, indent=1))
+    if any("erreur" in r for r in resultats):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

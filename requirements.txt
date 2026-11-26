@@ -1,0 +1,6 @@
+# Dépendances du skill video-resume (Python 3.10+).
+# ffmpeg (ffmpeg + ffprobe) doit aussi être installé à part : voir README.md.
+faster-whisper
+pillow
+numpy
+yt-dlp
